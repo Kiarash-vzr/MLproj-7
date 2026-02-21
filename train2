@@ -1,0 +1,344 @@
+# train_absa_improved.py
+import os
+import re
+import html
+import random
+import argparse
+from collections import Counter
+from functools import partial
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import CrossEntropyLoss
+from torch import amp                               # <-- use torch.amp
+from transformers import (
+    AutoTokenizer,
+    RobertaForSequenceClassification,
+    get_linear_schedule_with_warmup
+)
+
+from torch.optim import AdamW
+from sklearn.metrics import f1_score, accuracy_score, classification_report, confusion_matrix
+
+# -------------------------
+# utils / preprocessing
+# -------------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def seed_worker(worker_id):
+    np.random.seed(42 + worker_id)
+    random.seed(42 + worker_id)
+
+def clean_text(s, lower=False):
+    """Basic cleaning: html unescape, remove tags, normalize whitespace."""
+    if pd.isna(s):
+        return ""
+    s = html.unescape(str(s))
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if lower:
+        s = s.lower()
+    return s
+
+# -------------------------
+# Dataset (batch tokenization in init)
+# -------------------------
+class ABSADataset(Dataset):
+    def __init__(self, df, tokenizer, max_len=128, lower_text=False):
+        df = df.dropna(subset=["text", "aspect", "sentiment"]).reset_index(drop=True)
+
+        self.texts = [clean_text(t, lower=lower_text) for t in df["text"].astype(str).tolist()]
+        self.aspects = [clean_text(a, lower=lower_text) for a in df["aspect"].astype(str).tolist()]
+        self.labels = df["sentiment"].tolist()
+
+        self.label_map = {"negative": 0, "neutral": 1, "positive": 2}
+        self.label_ids = [self.label_map[l] for l in self.labels]
+
+        encodings = tokenizer(
+            self.texts,
+            self.aspects,
+            padding=False,
+            truncation="only_first",
+            max_length=max_len,
+            return_attention_mask=True,
+            return_token_type_ids=False
+        )
+
+        self.input_ids = encodings["input_ids"]
+        self.attention_mask = encodings["attention_mask"]
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        return {
+            "input_ids": self.input_ids[idx],
+            "attention_mask": self.attention_mask[idx],
+            "labels": self.label_ids[idx]
+        }
+
+# -------------------------
+# collate_fn using tokenizer.pad (top-level function!)
+# -------------------------
+def data_collator(batch, tokenizer):
+    input_dict = {
+        "input_ids": [b["input_ids"] for b in batch],
+        "attention_mask": [b["attention_mask"] for b in batch]
+    }
+    batch_enc = tokenizer.pad(input_dict, padding=True, return_tensors="pt")
+    labels = torch.tensor([b["labels"] for b in batch], dtype=torch.long)
+    batch_enc["labels"] = labels
+    return batch_enc
+
+# -------------------------
+# training & evaluation
+# -------------------------
+def train_epoch(model, dataloader, optimizer, scheduler, device, scaler, loss_fn, grad_clip=None):
+    model.train()
+    total_loss = 0.0
+    preds = []
+    trues = []
+
+    # choose device_type string for autocast
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    for batch in tqdm(dataloader, desc="Train batches", leave=False):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+        # use torch.amp.autocast
+        with amp.autocast(device_type=device_type):
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+            logits = outputs.logits
+            loss = loss_fn(logits, labels)
+
+        scaler.scale(loss).backward()
+        if grad_clip:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+
+        total_loss += loss.item()
+        preds.extend(torch.argmax(logits, dim=1).detach().cpu().numpy())
+        trues.extend(labels.detach().cpu().numpy())
+
+    avg_loss = total_loss / len(dataloader)
+    acc = accuracy_score(trues, preds)
+    macro_f1 = f1_score(trues, preds, average="macro")
+    return avg_loss, acc, macro_f1, trues, preds
+
+def eval_epoch(model, dataloader, device, loss_fn):
+    model.eval()
+    total_loss = 0.0
+    preds = []
+    trues = []
+
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Val batches", leave=False):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            # it's fine to use autocast in eval too (will be no grad)
+            with amp.autocast(device_type=device_type):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+                logits = outputs.logits
+                loss = loss_fn(logits, labels)
+
+            total_loss += loss.item()
+            preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+            trues.extend(labels.cpu().numpy())
+
+    avg_loss = total_loss / len(dataloader)
+    acc = accuracy_score(trues, preds)
+    macro_f1 = f1_score(trues, preds, average="macro")
+    return avg_loss, acc, macro_f1, trues, preds
+
+# -------------------------
+# main
+# -------------------------
+def main(args):
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+
+    # read data
+    train_df = pd.read_csv(args.train_csv, sep=None, engine="python")
+    val_df = pd.read_csv(args.val_csv, sep=None, engine="python")
+
+    allowed = {"negative", "neutral", "positive"}
+    train_df = train_df[train_df["sentiment"].isin(allowed)].reset_index(drop=True)
+    val_df = val_df[val_df["sentiment"].isin(allowed)].reset_index(drop=True)
+
+    print("Train examples:", len(train_df))
+    print("Val examples:", len(val_df))
+    print("Train label distribution:\n", train_df["sentiment"].value_counts())
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+
+    # Datasets
+    train_dataset = ABSADataset(train_df, tokenizer, max_len=args.max_len)
+    val_dataset = ABSADataset(val_df, tokenizer, max_len=args.max_len)
+
+    # DataLoaders with top-level collate_fn via functools.partial
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=partial(data_collator, tokenizer=tokenizer),
+        num_workers=args.num_workers,
+        pin_memory=True,
+        worker_init_fn=seed_worker
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=partial(data_collator, tokenizer=tokenizer),
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+
+    # model
+    model = RobertaForSequenceClassification.from_pretrained(args.model_name, num_labels=3)
+    model.to(device)
+
+    # class weights
+    label_map = {"negative": 0, "neutral": 1, "positive": 2}
+    train_counts = Counter(train_df["sentiment"].map(lambda x: label_map[x]))
+    counts = [train_counts[i] for i in range(3)]
+    total = sum(counts)
+    class_weights = [total / (c if c > 0 else 1) for c in counts]
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+    print("Class weights:", class_weights.cpu().numpy())
+
+    loss_fn = lambda logits, labels: CrossEntropyLoss(weight=class_weights)(logits, labels)
+
+    # optimizer
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], "weight_decay": args.weight_decay},
+        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+    ]
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr)
+
+    total_steps = len(train_loader) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(args.warmup_ratio * total_steps),
+        num_training_steps=total_steps
+    )
+
+    # Use torch.amp.GradScaler (new API) and enable it only if using CUDA
+    scaler = amp.GradScaler()  # or amp.GradScaler(enabled=(device.type=='cuda'))
+
+    # training loop
+    best_val_f1 = -1.0
+    patience_counter = 0
+    history = {"train_loss": [], "train_acc": [], "train_f1": [], "val_loss": [], "val_acc": [], "val_f1": []}
+
+    for epoch in range(args.epochs):
+        print(f"\n=== Epoch {epoch+1}/{args.epochs} ===")
+        train_loss, train_acc, train_f1, _, _ = train_epoch(model, train_loader, optimizer, scheduler, device, scaler, loss_fn, grad_clip=args.grad_clip)
+        val_loss, val_acc, val_f1, val_trues, val_preds = eval_epoch(model, val_loader, device, loss_fn)
+
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["train_f1"].append(train_f1)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        history["val_f1"].append(val_f1)
+
+        print(f"Train Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | Macro-F1: {train_f1:.4f}")
+        print(f"Val   Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | Macro-F1: {val_f1:.4f}")
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
+            os.makedirs(args.output_dir, exist_ok=True)
+            best_path = os.path.join(args.output_dir, "best_model.pt")
+            torch.save(model.state_dict(), best_path)
+            print(f"Saved best model to {best_path} (Val Macro-F1: {val_f1:.4f})")
+        else:
+            patience_counter += 1
+            print(f"No improvement. patience {patience_counter}/{args.patience}")
+        if patience_counter >= args.patience:
+            print("Early stopping triggered.")
+            break
+
+    # final evaluation
+    print("\n=== Final Evaluation on Validation Set ===")
+    model.load_state_dict(torch.load(os.path.join(args.output_dir, "best_model.pt")))
+    model.to(device)
+    val_loss, val_acc, val_f1, val_trues, val_preds = eval_epoch(model, val_loader, device, loss_fn)
+    print(f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val Macro-F1: {val_f1:.4f}")
+    print("\nClassification Report:\n", classification_report(val_trues, val_preds, target_names=["neg","neu","pos"]))
+    cm = confusion_matrix(val_trues, val_preds)
+    print("Confusion Matrix:\n", cm)
+
+    # save history
+    hist_df = pd.DataFrame(history)
+    hist_df.to_csv(os.path.join(args.output_dir, "train_history.csv"), index=False)
+    print("Saved history to train_history.csv")
+
+    # plot metrics
+    epochs_range = range(1, len(history["train_loss"]) + 1)
+    plt.figure(figsize=(8,4))
+    plt.plot(epochs_range, history["train_loss"], label="train loss")
+    plt.plot(epochs_range, history["val_loss"], label="val loss")
+    plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, "loss.png")); plt.close()
+
+    plt.figure(figsize=(8,4))
+    plt.plot(epochs_range, history["train_acc"], label="train acc")
+    plt.plot(epochs_range, history["val_acc"], label="val acc")
+    plt.xlabel("epoch"); plt.ylabel("accuracy"); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, "acc.png")); plt.close()
+
+    plt.figure(figsize=(8,4))
+    plt.plot(epochs_range, history["train_f1"], label="train macro-f1")
+    plt.plot(epochs_range, history["val_f1"], label="val macro-f1")
+    plt.xlabel("epoch"); plt.ylabel("macro-f1"); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, "f1.png")); plt.close()
+    print(f"Plots saved to {args.output_dir}")
+
+# -------------------------
+# Entry point
+# -------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_csv", type=str, default="train.csv")
+    parser.add_argument("--val_csv", type=str, default="val.csv")
+    parser.add_argument("--model_name", type=str, default="roberta-base")
+    parser.add_argument("--output_dir", type=str, default="absa_output")
+    parser.add_argument("--max_len", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+
+    # Use parse_known_args to ignore arguments passed by Jupyter/Colab kernel
+    args, unknown = parser.parse_known_args()
+    main(args)
